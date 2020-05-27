@@ -379,6 +379,24 @@ export abstract class MenuBase extends BaseElement {
     this.open = true;
   }
 
+  getFocusedItemIndex() {
+    const listElement = this.listElement;
+
+    if (listElement) {
+      return listElement.getFocusedItemIndex();
+    }
+
+    return -1;
+  }
+
+  focusItemAtIndex(index: number) {
+    const listElement = this.listElement;
+
+    if (listElement) {
+      listElement.focusItemAtIndex(index);
+    }
+  }
+
   layout(updateItems = true) {
     const listElement = this.listElement;
 

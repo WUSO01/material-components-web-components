@@ -13,13 +13,17 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-*/
+*/// tslint:disable:strip-private-property-underscore
+
 import '@material/mwc-notched-outline';
 import '@material/mwc-menu';
 import '@material/mwc-icon';
 
+import {normalizeKey} from '@material/dom/keyboard';
 import {MDCFloatingLabelFoundation} from '@material/floating-label/foundation.js';
 import {MDCLineRippleFoundation} from '@material/line-ripple/foundation.js';
+import {numbers} from '@material/list/constants';
+import {MDCListTextAndIndex} from '@material/list/types';
 import {addHasRemoveClass, FormElement} from '@material/mwc-base/form-element.js';
 import {observer} from '@material/mwc-base/observer.js';
 import {floatingLabel, FloatingLabel} from '@material/mwc-floating-label';
@@ -29,10 +33,9 @@ import {Menu} from '@material/mwc-menu';
 import {NotchedOutline} from '@material/mwc-notched-outline';
 import {MDCSelectAdapter} from '@material/select/adapter';
 import MDCSelectFoundation from '@material/select/foundation.js';
-import {html, property, query, TemplateResult} from 'lit-element';
+import {eventOptions, html, property, query, TemplateResult} from 'lit-element';
 import {classMap} from 'lit-html/directives/class-map.js';
 import {ifDefined} from 'lit-html/directives/if-defined.js';
-
 
 // must be done to get past lit-analyzer checks
 declare global {
@@ -117,7 +120,6 @@ export abstract class SelectBase extends FormElement {
 
   @query('.mdc-menu') protected menuElement!: Menu|null;
 
-
   @query('.mdc-select__anchor') protected anchorElement!: HTMLDivElement|null;
 
   @property({type: Boolean, attribute: 'disabled', reflect: true})
@@ -170,10 +172,25 @@ export abstract class SelectBase extends FormElement {
 
   @property({type: Boolean}) protected isUiValid = true;
 
+  // Transiently holds current typeahead prefix from user.
+  protected typeaheadBuffer = '';
+  protected typeaheadBufferClearTimeout = 0;
+  // Persistently holds most recent first character typed by user.
+  protected currentFirstChar = '';
+  protected readonly sortedIndexByFirstChar =
+      new Map<string, MDCListTextAndIndex[]>();
+  protected sortedIndexCursor = 0;
+
+  protected menuElement_: Menu|null = null;
+
   get items(): ListItemBase[] {
-    const menuElement = this.menuElement;
-    if (menuElement) {
-      return menuElement.items;
+    // memoize menuElement to prevent unnecessary querySelector calls.
+    if (!this.menuElement_) {
+      this.menuElement_ = this.menuElement;
+    }
+
+    if (this.menuElement_) {
+      return this.menuElement_.items;
     }
 
     return [];
@@ -209,7 +226,7 @@ export abstract class SelectBase extends FormElement {
   }
 
   protected renderReady = false;
-  private valueSetDirectly = false;
+  protected valueSetDirectly = false;
 
   validityTransform:
       ((value: string,
@@ -246,7 +263,9 @@ export abstract class SelectBase extends FormElement {
     const describedby = this.shouldRenderHelperText ? 'helper-text' : undefined;
 
     return html`
-      <div class="mdc-select ${classMap(classes)}">
+      <div
+          class="mdc-select ${classMap(classes)}"
+          @keydown=${this.handleTypeahead}>
         <input
             class="formElement"
             .value=${this.value}
@@ -298,7 +317,8 @@ export abstract class SelectBase extends FormElement {
             .anchor=${this.anchorElement}
             @selected=${this.onSelected}
             @opened=${this.onOpened}
-            @closed=${this.onClosed}>
+            @closed=${this.onClosed}
+            @list-item-rendered=${this.onListItemConnected}>
           <slot></slot>
         </mwc-menu>
       </div>
@@ -614,7 +634,12 @@ export abstract class SelectBase extends FormElement {
       this.selectByValue(this.value);
     }
 
+    this.initTypeaheadState();
     this.renderReady = true;
+  }
+
+  protected onListItemConnected() {
+    this.initTypeaheadState();
   }
 
   select(index: number) {
@@ -706,6 +731,178 @@ export abstract class SelectBase extends FormElement {
     if (this.mdcFoundation) {
       this.mdcFoundation.handleKeydown(evt);
     }
+  }
+
+  protected isTypeaheadInProgress(): boolean {
+    return this.typeaheadBuffer.length > 0;
+  }
+
+  @eventOptions({capture: true})
+  protected handleTypeahead(event: KeyboardEvent) {
+    const isArrowLeft = normalizeKey(event) === 'ArrowLeft';
+    const isArrowUp = normalizeKey(event) === 'ArrowUp';
+    const isArrowRight = normalizeKey(event) === 'ArrowRight';
+    const isArrowDown = normalizeKey(event) === 'ArrowDown';
+    const isHome = normalizeKey(event) === 'Home';
+    const isEnd = normalizeKey(event) === 'End';
+    const isEnter = normalizeKey(event) === 'Enter';
+    const isSpace = normalizeKey(event) === 'Spacebar';
+    const isMeta =
+        // tslint:disable-next-line:deprecation
+        event.key === 'Meta' || event.keyCode === 91 || event.keyCode === 93;
+
+    const ignoreTypeahead = isArrowLeft || isArrowUp || isArrowRight ||
+        isArrowDown || isHome || isEnd || isEnter || isMeta;
+
+    if (isSpace && this.isTypeaheadInProgress()) {
+      // prevents space from selecting which is handled by mwc-list
+      event.stopPropagation();
+      event.preventDefault();
+      // space participates in typeahead matching if in rapid typing mode
+      this.typeaheadMatchItem(' ');
+    } else if (!ignoreTypeahead && event.key.length === 1) {
+      // focus first item matching prefix
+      event.preventDefault();
+      this.typeaheadMatchItem(event.key.toLowerCase());
+    }
+  }
+
+  /**
+   * Initializes typeahead state by indexing the current list items by primary
+   * text into the sortedIndexByFirstChar data structure.
+   */
+  protected initTypeaheadState() {
+    this.sortedIndexByFirstChar.clear();
+
+    // Aggregate item text to index mapping
+    for (let i = 0; i < this.items.length; i++) {
+      const textAtIndex = this.items[i].text;
+      if (!textAtIndex) {
+        continue;
+      }
+
+      const firstChar = textAtIndex[0].toLowerCase();
+      if (!this.sortedIndexByFirstChar.has(firstChar)) {
+        this.sortedIndexByFirstChar.set(firstChar, []);
+      }
+      this.sortedIndexByFirstChar.get(firstChar)!.push(
+          {text: this.items[i].text.toLowerCase(), index: i});
+    }
+
+    // Sort the mapping
+    // TODO(b/157162694): Investigate replacing forEach with Map.values()
+    this.sortedIndexByFirstChar.forEach((values) => {
+      values.sort((first: MDCListTextAndIndex, second: MDCListTextAndIndex) => {
+        return first.index - second.index;
+      });
+    });
+  }
+
+  /**
+   * Given the next desired character from the user, adds it to the typeahead
+   * buffer; then, beginning from the currently focused option, attempts to
+   * find the next option matching the buffer. Wraps around if at the
+   * end of options.
+   */
+  protected typeaheadMatchItem(nextChar: string) {
+    clearTimeout(this.typeaheadBufferClearTimeout);
+
+    this.typeaheadBufferClearTimeout =
+        setTimeout(() => {
+          this.typeaheadBuffer = '';
+        }, numbers.TYPEAHEAD_BUFFER_CLEAR_TIMEOUT_MS) as unknown as number;
+
+    this.typeaheadBuffer += nextChar;
+
+    let index: number;
+    if (this.typeaheadBuffer.length === 1) {
+      index = this.matchFirstChar();
+    } else {
+      index = this.matchAllChars();
+    }
+
+    if (index !== -1 && this.menuElement) {
+      this.menuElement.focusItemAtIndex(index);
+    }
+    return index;
+  }
+
+  /**
+   * Matches the user's single input character in the buffer to the
+   * next option that begins with such character. Wraps around if at
+   * end of options.
+   */
+  protected matchFirstChar(): number {
+    const menuElement = this.menuElement;
+    const firstChar = this.typeaheadBuffer[0];
+    const itemsMatchingFirstChar = this.sortedIndexByFirstChar.get(firstChar);
+    if (!itemsMatchingFirstChar || !menuElement) {
+      return -1;
+    }
+
+    // Has the same firstChar been recently matched?
+    // Also, did focus remain the same between key presses?
+    // If both hold true, simply increment index.
+    if (firstChar === this.currentFirstChar &&
+        itemsMatchingFirstChar[this.sortedIndexCursor].index ===
+            menuElement.getFocusedItemIndex()) {
+      this.sortedIndexCursor =
+          (this.sortedIndexCursor + 1) % itemsMatchingFirstChar.length;
+
+      return itemsMatchingFirstChar[this.sortedIndexCursor].index;
+    }
+
+    // If we're here, either firstChar changed, or focus was moved between
+    // keypresses thus invalidating the cursor.
+    this.currentFirstChar = firstChar;
+    this.sortedIndexCursor = 0;
+
+    // Advance cursor to first item matching the firstChar that is positioned
+    // after focused item. Cursor is unchanged if there's no such item.
+    for (let cursorPosition = 0; cursorPosition < itemsMatchingFirstChar.length;
+         cursorPosition++) {
+      if (itemsMatchingFirstChar[cursorPosition].index >
+          menuElement.getFocusedItemIndex()) {
+        this.sortedIndexCursor = cursorPosition;
+        break;
+      }
+    }
+
+    return itemsMatchingFirstChar[this.sortedIndexCursor].index;
+  }
+
+  /**
+   * Attempts to find the next item that matches all of the typeahead buffer.
+   * Wraps around if at end of options.
+   */
+  protected matchAllChars(): number {
+    const firstChar = this.typeaheadBuffer[0];
+    const itemsMatchingFirstChar = this.sortedIndexByFirstChar.get(firstChar);
+    if (!itemsMatchingFirstChar) {
+      return -1;
+    }
+
+    // Do nothing if text already matches
+    if (itemsMatchingFirstChar[this.sortedIndexCursor].text.lastIndexOf(
+            this.typeaheadBuffer, 0) === 0) {
+      return itemsMatchingFirstChar[this.sortedIndexCursor].index;
+    }
+
+    // Find next item that matches completely; if no match, we'll eventually
+    // loop around to same position
+    let cursorPosition =
+        (this.sortedIndexCursor + 1) % itemsMatchingFirstChar.length;
+    while (cursorPosition !== this.sortedIndexCursor) {
+      const matches = itemsMatchingFirstChar[cursorPosition].text.lastIndexOf(
+                          this.typeaheadBuffer, 0) === 0;
+      if (matches) {
+        this.sortedIndexCursor = cursorPosition;
+        break;
+      }
+
+      cursorPosition = (cursorPosition + 1) % itemsMatchingFirstChar.length;
+    }
+    return itemsMatchingFirstChar[this.sortedIndexCursor].index;
   }
 
   protected async onSelected(evt: CustomEvent<{index: number}>) {

@@ -306,31 +306,7 @@ export abstract class ListBase extends BaseElement {
 
         return 0;
       },
-      getFocusedElementIndex: () => {
-        if (!this.mdcRoot) {
-          return -1;
-        }
-
-        if (!this.items.length) {
-          return -1;
-        }
-
-        const activeElementPath = deepActiveElementPath();
-
-        if (!activeElementPath.length) {
-          return -1;
-        }
-
-        for (let i = activeElementPath.length - 1; i >= 0; i--) {
-          const activeItem = activeElementPath[i];
-
-          if (isListItem(activeItem)) {
-            return this.items.indexOf(activeItem);
-          }
-        }
-
-        return -1;
-      },
+      getFocusedElementIndex: this.getFocusedItemIndex,
       getAttributeForElementIndex: (index, attr) => {
         const listElement = this.mdcRoot;
         if (!listElement) {
@@ -490,6 +466,44 @@ export abstract class ListBase extends BaseElement {
         first.tabindex = 0;
       }
     }
+  }
+
+  getFocusedItemIndex() {
+    if (!this.mdcRoot) {
+      return -1;
+    }
+
+    if (!this.items.length) {
+      return -1;
+    }
+
+    const activeElementPath = deepActiveElementPath();
+
+    if (!activeElementPath.length) {
+      return -1;
+    }
+
+    for (let i = activeElementPath.length - 1; i >= 0; i--) {
+      const activeItem = activeElementPath[i];
+
+      if (isListItem(activeItem)) {
+        return this.items.indexOf(activeItem);
+      }
+    }
+
+    return -1;
+  }
+
+  focusItemAtIndex(index: number) {
+    for (const item of this.items) {
+      if (item.tabindex === 0) {
+        item.tabindex = -1;
+        break;
+      }
+    }
+
+    this.items[index].tabindex = 0;
+    this.items[index].focus();
   }
 
   focus() {
